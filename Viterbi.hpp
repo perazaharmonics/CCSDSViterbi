@@ -80,7 +80,9 @@ namespace sdr::mdm
         // Inverted HERE at the source of so rate 1/2 and all rate 3/4 puncture
         // phases emit the inverted C2 consistently
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        uint8_t p2=Parity(z&g2)^1u;     // Compute parity bit 2 (G2=133 octal), inverted per CCSDS Blue Book
+        uint8_t p2=Parity(z&g2);        // Compute parity bit 2 (G2=133 octal), raw
+        if (!ccfg.p34)                  // No puncturing?
+          p2=static_cast<uint8_t>(p2^1u);// Invert G2 for the basic rate 1/2 only
         //Deb(" Convolutional Encode: Input Bit=%d Shift Reg=%02X Parity Bits=[%d,%d]",u,z,p1,p2);
         if (!ccfg.p34)                  // Rate 1/2?
         {                               // Yes, output both parity bits
@@ -100,11 +102,11 @@ namespace sdr::mdm
           }                             //
           else if (ph==1)               // Phase 1: output only parity bit 1
           {                             //
-            o->push_back(p1);           // Output parity bit 1
+            o->push_back(p2);           // Output parity bit 2 C2
           }                             //
           else                          // Phase 2: output only parity bit 2
           {                             //
-            o->push_back(p2);           // Output parity bit 2
+            o->push_back(p1);           // Output parity bit 1
           }                             //
           ph=(ph+1)%3;                  // Advance puncturing phase
           //Deb(" [END] Convolutional Encode: Puncturing Phase=%d",ph);
@@ -190,7 +192,7 @@ namespace sdr::mdm
             if (idx+1>=nbits)           // Not enough bits left?
               break;                    // Done processing
             r1=(*ch)[idx++]&1u;         // Get parity bit 1
-            r2=(*ch)[idx++]&1u;         // Get parity bit 2
+            r2=static_cast<uint8_t>(((*ch)[idx++]&1u)^1u); // Get parity bit 2;
             hp1=1;                      // Mark parity bit 1 received
             hp2=1;                      // Mark parity bit 2 received
             ////Deb(" DecodeBits: Rate 1/2, r1=%d r2=%d",r1,r2);
@@ -210,13 +212,13 @@ namespace sdr::mdm
               hp2=1;                    // Mark parity bit 2 received
               ////Deb(" DecodeBits: Rate 3/4, ph=%d r1=%d r2=%d",ph,r1,r2);
             }                           // Done with phase 0
-            else if (ph==1)             // At phase 1?
+            else if (ph==1)             // At phase 1 (t=2)?
             {                           // Yes, get only parity bit 1
               if (idx>=nbits)           // Not enough bits left?
                 break;                  // Done processing
               r1=(*ch)[idx++]&1u;       // Get parity bit 1
-              hp1=1;                    // Mark parity bit 1 received
-              hp2=0;                    // Parity bit 2 not received
+              hp1=0;                    // Mark parity bit 1 received
+              hp2=1;                    // Parity bit 2 not received
               ////Deb(" DecodeBits: Rate 3/4, ph=%d r1=%d",ph,r1);
             }                           // Done with phase 1
             else                        // Else phase 2
@@ -224,8 +226,8 @@ namespace sdr::mdm
               if (idx>=nbits)           // Not enough bits left?
                 break;                  // Done processing
               r2=(*ch)[idx++]&1u;       // Get parity bit 2
-              hp1=0;                    // Parity bit 1 not received
-              hp2=1;                    // Mark parity bit 2 received
+              hp1=1;                    // Parity bit 1 not received
+              hp2=0;                    // Mark parity bit 2 received
               //Deb(" DecodeBits: Rate 3/4, ph=%d r2=%d",ph,r2);
             }                           // Done with phase 2
           }                             // Done with 3/4 punctured code
@@ -280,7 +282,7 @@ namespace sdr::mdm
             r1=(*ch)[idx]&1u;            // Get parity bit 1
             w1=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 1
             idx++;                      // Advance index
-            r2=(*ch)[idx]&1u;            // Get parity bit 2
+            r2=static_cast<uint8_t>(((*ch)[idx++]&1u)^1u); // Get parity bit 2
             w2=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 2
             idx++;                      // Advance index
             hp1=1;                      // Mark parity bit 1 received
@@ -313,8 +315,8 @@ namespace sdr::mdm
               r1=(*ch)[idx]&1u;          // Get parity bit 1
               w1=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 1
               idx++;                    // Advance index
-              hp1=1;                    // Mark parity bit 1 received
-              hp2=0;                    // Parity bit 2 not received
+              hp1=0;                    // Mark parity bit 1 received
+              hp2=1;                    // Parity bit 2 not received
               //Deb(" DecodeBitsWeighted: Rate 3/4, ph=%d r1=%d w1=%.2f",ph,r1,w1);
             }                           // Done with phase 1
             else                        // Else phase 2
@@ -324,8 +326,8 @@ namespace sdr::mdm
               r2=(*ch)[idx]&1u;          // Get parity bit 2
               w2=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 2
               idx++;                    // Advance index
-              hp1=0;                    // Parity bit 1 not received
-              hp2=1;                    // Mark parity bit 2 received
+              hp1=1;                    // Parity bit 1 not received
+              hp2=0;                    // Mark parity bit 2 received
               //Deb(" DecodeBitsWeighted: Rate 3/4, ph=%d r2=%d w2=%.2f",ph,r2,w2);
             }                           // Done with phase 2
           }                             // Done with 3/4 punctured code
@@ -455,7 +457,7 @@ namespace sdr::mdm
               // so the trellis expects the inverted C2 for rate 1/2 AND 3/4
               // (the puncture metric reads this same table entry)
               // ~~~~~~~~~~~~~~~~~~~~~~ //
-              out[s][b][1]=static_cast<uint8_t>(Parity(static_cast<uint32_t>(zprm)&g2)^1u);// Expected C2 (G2), inverted per CCSDS Blue Book
+              out[s][b][1]=static_cast<uint8_t>(Parity(static_cast<uint32_t>(zprm)&g2));// RAW
               // //Deb(" BuildTrellis: State %02X Input %d -> Next %02X Output [%d,%d]",
               //    s,b,next[s][b],out[s][b][0],out[s][b][1]);
             }                           // Done for each input bit
