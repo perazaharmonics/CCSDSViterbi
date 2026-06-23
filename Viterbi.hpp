@@ -216,7 +216,7 @@ namespace sdr::mdm
             {                           // Yes, get only parity bit 1
               if (idx>=nbits)           // Not enough bits left?
                 break;                  // Done processing
-              r1=(*ch)[idx++]&1u;       // Get parity bit 1
+              r2=(*ch)[idx++]&1u;       // Get parity bit 1
               hp1=0;                    // Mark parity bit 1 received
               hp2=1;                    // Parity bit 2 not received
               ////Deb(" DecodeBits: Rate 3/4, ph=%d r1=%d",ph,r1);
@@ -225,7 +225,7 @@ namespace sdr::mdm
             {                           // Get only parity bit 2
               if (idx>=nbits)           // Not enough bits left?
                 break;                  // Done processing
-              r2=(*ch)[idx++]&1u;       // Get parity bit 2
+              r1=(*ch)[idx++]&1u;       // Get parity bit 2
               hp1=1;                    // Parity bit 1 not received
               hp2=0;                    // Mark parity bit 2 received
               //Deb(" DecodeBits: Rate 3/4, ph=%d r2=%d",ph,r2);
@@ -282,7 +282,7 @@ namespace sdr::mdm
             r1=(*ch)[idx]&1u;            // Get parity bit 1
             w1=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 1
             idx++;                      // Advance index
-            r2=static_cast<uint8_t>(((*ch)[idx++]&1u)^1u); // Get parity bit 2
+            r2=static_cast<uint8_t>(((*ch)[idx]&1u)^1u); // Get parity bit 2
             w2=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 2
             idx++;                      // Advance index
             hp1=1;                      // Mark parity bit 1 received
@@ -312,8 +312,8 @@ namespace sdr::mdm
             {                           // Yes
               if (idx>=nbits)           // Not enough bits left?
                 break;                  // Done processing
-              r1=(*ch)[idx]&1u;          // Get parity bit 1
-              w1=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 1
+              r2=(*ch)[idx]&1u;          // Get parity bit 1
+              w2=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 1
               idx++;                    // Advance index
               hp1=0;                    // Mark parity bit 1 received
               hp2=1;                    // Parity bit 2 not received
@@ -323,8 +323,8 @@ namespace sdr::mdm
             {                           //
               if (idx>=nbits)           // Not enough bits left?
                 break;                  // Done processing
-              r2=(*ch)[idx]&1u;          // Get parity bit 2
-              w2=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 2
+              r1=(*ch)[idx]&1u;          // Get parity bit 2
+              w1=std::clamp((*w)[idx],0.f,1.f);// Get weight for parity bit 2
               idx++;                    // Advance index
               hp1=1;                    // Parity bit 1 not received
               hp2=0;                    // Mark parity bit 2 received
