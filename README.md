@@ -1,10 +1,10 @@
 # CCSDSViterbi
 
-A high-performance C++ implementation of the CCSDS (Consultative Committee for Space Data Systems) standard Rate 1/2 and Rate 3/4 Convolutional Encoder with Viterbi Decoder, implementing CCSDS-131.0-B-5 specifications.
+A high-performance C++ implementation of the CCSDS (Consultative Committee for Space Data Systems) standard Rate 1/2 and Rate 3/4 Convolutional Encoder with Viterbi Decoder, implementing CCSDS-131.[...]
 
 ## Overview
 
-This library provides production-grade implementations of convolutional encoding and maximum-likelihood sequence estimation (Viterbi) decoding for satellite and deep-space communications. The implementation strictly adheres to CCSDS Blue Book standards and includes support for both standard rate 1/2 and punctured rate 3/4 convolutional codes.
+This library provides production-grade implementations of convolutional encoding and maximum-likelihood sequence estimation (Viterbi) decoding for satellite and deep-space communications. The imple[...] 
 
 ## Mathematical Foundation
 
@@ -53,6 +53,71 @@ The Viterbi decoder performs **maximum-likelihood sequence detection** on the re
 - **Path Metrics:** Accumulated minimum cost from initial state to current state
 
 The algorithm proceeds in $N$ stages (one per input bit) and produces an estimate of the transmitted bit sequence with near-optimal performance.
+
+### Soft Output Viterbi Algorithm (SOVA) — Mathematical Background
+
+SOVA extends the Viterbi algorithm by outputting both hard decisions and per-bit reliability values. Instead of only producing
+$\hat{u}_k \in \{0,1\}$, it also estimates a soft confidence quantity suitable for downstream soft-input decoding.
+
+#### Channel model and symbol LLRs
+
+For BPSK over AWGN:
+
+$$y_k = x_k + n_k, \qquad n_k \sim \mathcal{N}(0,\sigma^2), \qquad x_k \in \{+1,-1\}$$
+
+The coded-symbol LLR is:
+
+$$L_c(k) = \log\frac{P(c_k=+1\mid y_k)}{P(c_k=-1\mid y_k)} = \frac{2}{\sigma^2}y_k$$
+
+Equivalent binary-domain conventions are obtained via the usual antipodal mapping.
+
+#### Soft branch metrics
+
+Let branch $b$ at stage $k$ emit coded vector
+$\mathbf{c}_k^{(b)}=[c_{k,1}^{(b)},\dots,c_{k,m}^{(b)}]$, with channel soft values
+$\mathbf{L}_k=[L_{k,1},\dots,L_{k,m}]$.
+
+A max-log compatible branch metric is:
+
+$$\gamma_k(b) = -\frac{1}{2}\sum_{j=1}^{m} L_{k,j}\,c_{k,j}^{(b)}$$
+
+Any equivalent metric differing only by additive/scale constants preserves survivor decisions.
+
+#### Path-metric recursion
+
+With trellis state $s$ at stage $k$:
+
+$$M_k(s)=\min_{b\in\mathcal{B}(s)}\left\{M_{k-1}(s')+\gamma_k(b)\right\}$$
+
+where $\mathcal{B}(s)$ is the set of branches entering state $s$, and $s'$ is the predecessor for branch $b$.
+
+#### SOVA reliability from competing hypotheses
+
+Let survivor decision at time $k$ be $\hat{u}_k$, and let the best competing path enforce opposite bit hypothesis $1-\hat{u}_k$.
+Define metric separation:
+
+$$\Delta_k = M_k^{(\mathrm{comp})} - M_k^{(\mathrm{surv})}$$
+
+Then an approximate information-bit soft output is:
+
+$$L_u(k) \approx \alpha_k\,\Delta_k$$
+
+where $\alpha_k\in\{+1,-1\}$ encodes bit-to-sign convention (implementation dependent). Larger $|L_u(k)|$ means higher confidence.
+
+#### Traceback window and reliability propagation
+
+With traceback/window depth $T$, reliabilities are refined over the interval where survivor and competitor paths diverge/remerge. A common update is:
+
+$$|L_u(k)| \leftarrow \min_{\tau \in \mathcal{W}_k} \Delta_{k,\tau}$$
+
+where $\mathcal{W}_k$ is the local window associated with bit $k$.
+
+#### Relation to MAP decoding
+
+SOVA is a reduced-complexity approximation to BCJR/log-MAP family decoders:
+
+- Lower implementation complexity than full MAP in many real-time systems.
+- Soft outputs are approximate but typically strong enough for concatenated or iterative architectures.
 
 ## Implementation Details
 
@@ -123,6 +188,7 @@ decoder.Decode(&receivedBits, &decodedBits);
 
 - CCSDS 131.0-B-5: *Recommendation for Space Data Systems Standards — Telecommand — Part 1: Deep Space Craft.*
 - Viterbi, A., "Error bounds for convolutional codes and an asymptotically optimum decoding algorithm," *IEEE Transactions on Information Theory*, vol. 13, no. 2, pp. 260-269, April 1967.
+- Hagenauer, J., Höher, P., "A Viterbi algorithm with soft-decision outputs and its applications," *IEEE GLOBECOM*, 1989.
 
 ## Author
 
