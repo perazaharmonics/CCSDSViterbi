@@ -1,10 +1,10 @@
 # CCSDSViterbi
 
-A high-performance C++ implementation of the CCSDS (Consultative Committee for Space Data Systems) standard Rate 1/2 and Rate 3/4 Convolutional Encoder with Viterbi Decoder, implementing CCSDS-131.[...]
+A high-performance C++ implementation of the CCSDS (Consultative Committee for Space Data Systems) standard Rate 1/2 and Rate 3/4 Convolutional Encoder with Viterbi Decoder, implementing CCSDS-131.[..[...
 
 ## Overview
 
-This library provides production-grade implementations of convolutional encoding and maximum-likelihood sequence estimation (Viterbi) decoding for satellite and deep-space communications. The imple[...] 
+This library provides production-grade implementations of convolutional encoding and maximum-likelihood sequence estimation (Viterbi) decoding for satellite and deep-space communications. The imple[..[...
 
 ## Mathematical Foundation
 
