@@ -137,6 +137,17 @@ SOVA is a reduced-complexity approximation to BCJR/log-MAP family decoders:
 - **G2 Inversion Handling:** Automatic application and removal per CCSDS Blue Book
 - **Vector-Based I/O:** Efficient batch processing of bit sequences
 
+### SOVA in this codebase
+
+Following commit `e20b9975cf4e48c099c707e77ae5b83ccbf12553`, this codebase now exposes SOVA soft outputs in addition to hard decisions.
+
+- The decoder still performs trellis-based maximum-likelihood sequence estimation over 64 states.
+- In parallel with survivor selection, it tracks reliability information derived from competing-path metric separation.
+- The exposed soft outputs are aligned with decoded bit decisions and are intended for downstream soft-input consumers.
+- Existing hard-decision behavior remains available for compatibility with current frame-sync and bitstream pipelines.
+
+This keeps the implementation practical for CCSDS workflows that need both deterministic hard bits and confidence-aware post-processing.
+
 ### File Structure
 
 - `Viterbi.hpp` - Main header containing `ConvolutionalEncoder` and `ViterbiDecoder` classes
