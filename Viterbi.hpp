@@ -298,18 +298,23 @@ namespace sdr::mdm
       //
       //   STATUS: this is now full SOVA. ViterbiStepWeighted captures the ACS margin
       //   Delta and the discarded competitor at every node; TracebackSova runs the
-      //   reliability-update pass. Pass rel != nullptr to get soft output (hard bits
-      //   + per-bit |L|, units of cost/BM_SCALE); pass rel == nullptr (default) for
-      //   the classic soft-IN / hard-OUT MLSE traceback. Note there is no path-metric
-      //   renormalization, so drive short frames only. If you need the EXACT per-bit
-      //   APP LLR for the RS/frame-confidence path, BCJRDecoder remains the better
-      //   choice (SOVA's |L| is a max-log-MAP approximation, |L_SOVA| <= |L_BCJR|).
+      //   reliability-update pass. Both classic SOVA outputs are exposed since they
+      //   are computed together:
+      //     rel -> per-bit reliability MAGNITUDE |L| (>=0), units of cost/BM_SCALE;
+      //     llr -> signed classic-SOVA soft output L = sign(u_k)*|L|, L>0 favors
+      //            bit 0 / L<0 favors bit 1 (same convention as BCJRDecoder, so it
+      //            drops straight into the RS/frame-confidence path).
+      //   Leave both nullptr (default) for the classic soft-IN / hard-OUT MLSE
+      //   traceback. Note there is no path-metric renormalization, so drive short
+      //   frames only. If you need the EXACT per-bit APP LLR, BCJRDecoder remains the
+      //   better choice (SOVA's |L| is a max-log-MAP approximation, |L_SOVA| <= |L_BCJR|).
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //      
       inline void DecodeBitsWeighted (
        const std::vector<uint8_t>* ch,  // Input channel bits (hard 0/1)
         std::vector<float>* w,          // Weights for input channel bits
         std::vector<uint8_t>* const o,  // Output decoded input bits
-        std::vector<float>* rel=nullptr)// Optional per-bit SOVA reliability (~|LLR|); nullptr = hard only
+        std::vector<float>* rel=nullptr,// Optional per-bit SOVA reliability MAGNITUDE |L| (>=0)
+        std::vector<float>* llr=nullptr)// Optional signed classic-SOVA soft output L (L>0 favors bit 0)
       {                                 // ~~~~~~~~~~ DecodeBitsWeighted ~~~~~~~~~~ //
         if (ch==nullptr||w==nullptr||o==nullptr||ch->empty())
           return;
@@ -389,8 +394,8 @@ namespace sdr::mdm
           if (ccfg.p34)                 // Rate 3/4?
             ph=(ph+1)%3;                // Advance puncturing phase
         }                               // Done processing channel bits
-        if (rel!=nullptr)               // Soft output requested?
-          TracebackSova(o,rel,30);      // SOVA: hard bits + per-bit reliability, forward order
+        if (rel!=nullptr||llr!=nullptr) // Soft output requested (magnitude and/or signed LLR)?
+          TracebackSova(o,rel,30,llr);  // SOVA: hard bits + reliability |L| and/or signed LLR, forward order
         else                            // Hard output only
         {                               // Classic MLSE traceback
           std::vector<uint8_t> urev{};  // Reversed input bits
@@ -776,14 +781,17 @@ namespace sdr::mdm
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
       inline void TracebackSova (
         std::vector<uint8_t>* out,      // Output decoded bits (0/1)
-        std::vector<float>* rel,        // Output reliability for decoded bits (L>0 favors bit 0, L<0 favors bit 1)
-        int U=30)                       // Traceback depth for reliability update (0=only last bit, U=all bits)
+        std::vector<float>* rel,        // Output per-bit reliability MAGNITUDE |L| (>=0); nullptr to skip
+        int U=30,                       // Traceback depth for reliability update (0=only last bit, U=all bits)
+        std::vector<float>* llr=nullptr)// Optional signed classic-SOVA soft output L (L>0 favors bit 0); nullptr to skip
       {                                 // ~~~~~~~~~~ TracebackSova ~~~~~~~~~~ //
         if (out==nullptr)               // Bad args?
           return;                       // Nothing to do
         out->clear();                   // Clear output bits buffer
         if (rel!=nullptr)               // We have reliability buffer?
           rel->clear();                 // Clear reliability buffer
+        if (llr!=nullptr)               // We have signed soft-output buffer?
+          llr->clear();                 // Clear signed LLR buffer
         if (steps==0) return;           // No steps, nothing to do
         uint16_t bstm=INF;              // Best path metric
         int bsts=0;                     // Final state with best path metric
@@ -845,15 +853,17 @@ namespace sdr::mdm
         out->resize(tst);               // Resize output bits buffer
         if (rel!=nullptr)               // We have reliability buffer?
           rel->resize(tst);             // Resize reliability buffer
+        if (llr!=nullptr)               // We have signed soft-output buffer?
+          llr->resize(tst);             // Resize signed LLR buffer
         for (int t=0;t<tst;++t)         // For each time step
         {                               // Recollect maximally likely determined bits
           size_t idx=static_cast<size_t>(t); // Index for this time step
           (*out)[idx]=mlb[idx];         // Output ML bit for this time step
-          if (rel!=nullptr)             // We have a reliabilty buffer?
-          {                             // Yes
-            const float r=(ell[idx])/BM_SCALE_F32; // Get reliability |LLR|
-            (*rel)[idx]=r;              // Output reliability for this time step
-          }                             // Done with this time step
+          const float mag=(ell[idx])/BM_SCALE_F32; // Reliability MAGNITUDE |L| (cost/BM_SCALE)
+          if (rel!=nullptr)             // We have a reliability buffer?
+            (*rel)[idx]=mag;            // Output reliability magnitude for this time step
+          if (llr!=nullptr)             // We have a signed soft-output buffer?
+            (*llr)[idx]=(mlb[idx]?-mag:mag); // Classic SOVA LLR: +|L| for bit 0, -|L| for bit 1
         }                               // Done for each time step
       }                                 // ~~~~~~~~~~ TracebackSova ~~~~~~~~~~ //
   };
