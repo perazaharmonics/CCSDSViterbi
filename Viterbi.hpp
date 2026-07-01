@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <array>
 #include "Log.h"
 namespace sdr::mdm
 {
@@ -159,6 +160,9 @@ namespace sdr::mdm
         steps=0;                        // Reset step counter
         prev.clear();                   // Clear survivor paths
         bit.clear();                    // Clear input bits
+        dmarg.clear();                  // Clear SOVA margins
+        prevc.clear();                  // Clear SOVA competitor predecessors
+        bitc.clear();                   // Clear SOVA competitor input bits
       }                                 // ~~~~~~~~~~ Reset ~~~~~~~~~~ //
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
       // Decode a stream of hard bits (0/1). Output recovered input bits.
@@ -252,10 +256,57 @@ namespace sdr::mdm
         o->assign(urev.rbegin(),urev.rend());// Assign in forward order
         //Log("[END] Viterbi DecodeBits: output input bits=%zu",o->size());
       }                                 // ~~~~~~~~~~ DecodeBits ~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // DecodeBitsWeighted — Soft-Decision (Soft-Input) Viterbi, and the road to SOVA.
+      //
+      // THEORY
+      //   Classic Viterbi is Maximum-Likelihood Sequence Estimation (MLSE): it finds
+      //   the single trellis path  u_hat = argmax_u P(r|u), minimizing the FRAME
+      //   (sequence) error probability. It uses hard bits + a Hamming branch metric
+      //   and emits a hard survivor with NO per-bit confidence.
+      //
+      //   This routine is the SOFT-INPUT variant. Each received bit carries a weight
+      //   w in [0,1] (channel reliability) and the branch metric is a weighted
+      //   mismatch COST (lower = better):
+      //        BM(s->ns) = sum_i  w_i * [ c_i(s,ns) != r_i ]
+      //   an unreliable bit (w->0) barely moves the path metric. This beats hard
+      //   Viterbi (it exploits the analog margin) but the criterion is UNCHANGED:
+      //   still MLSE, still a HARD output.
+      //
+      //   SOVA (Soft-Output Viterbi Algorithm, Hagenauer & Hoeher 1989) bolts a
+      //   per-bit RELIABILITY onto the MLSE survivor, making Viterbi Soft-In/Soft-Out
+      //   (SISO). At every ACS merge the discarded competitor has metric M_comp and
+      //   the survivor M_surv; their margin
+      //        Delta = M_comp - M_surv >= 0
+      //   says how nearly the runner-up won. The bit APP magnitude is
+      //        |L(u_k)| ~= min{ Delta_j : competitor at node j disagrees with the
+      //                                   survivor on bit k },   sign(L)=hard decision.
+      //   A small Delta at a node where the two paths disagree on bit k => bit k is
+      //   unreliable.
+      //
+      //   RELATION TO BCJR (MAP): BCJR marginalizes over ALL paths (forward-backward)
+      //   for the EXACT per-bit APP LLR and minimizes BIT error probability. SOVA
+      //   keeps only the single best competitor, so it is a max-log-MAP-style
+      //   approximation:  |L_SOVA| <= |L_BCJR|  (~0.5 dB weaker in iterative use),
+      //   at ~2x hard-Viterbi cost vs BCJR's ~3-4x plus whole-block memory.
+      //
+      //     |                | criterion      | output      | cost        |
+      //     | Viterbi (hard) | MLSE (seq)     | hard        | 1x          |
+      //     | this (soft-in) | MLSE (seq)     | hard        | ~1x         |
+      //     | SOVA           | MLSE + reliab. | hard + LLR  | ~2x         |
+      //     | BCJR (MAP)     | MAP (per-bit)  | exact LLR   | ~3-4x + mem |
+      //
+      //   STATUS: as written this is soft-IN / hard-OUT (SDVA), NOT SOVA — it emits
+      //   no reliability. To make it SOVA, capture the ACS margin Delta per node and
+      //   run the reliability-update pass (see TracebackSova). If you only need soft
+      //   output for the RS/frame-confidence path, BCJRDecoder already gives exact
+      //   LLRs and is the better choice.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //      
       inline void DecodeBitsWeighted (
        const std::vector<uint8_t>* ch,  // Input channel bits (hard 0/1)
         std::vector<float>* w,          // Weights for input channel bits
-        std::vector<uint8_t>* const o)  // Output decoded input bits
+        std::vector<uint8_t>* const o,  // Output decoded input bits
+        std::vector<float>* rel=nullptr)// Optional per-bit SOVA reliability (~|LLR|); nullptr = hard only
       {                                 // ~~~~~~~~~~ DecodeBitsWeighted ~~~~~~~~~~ //
         if (ch==nullptr||w==nullptr||o==nullptr||ch->empty())
           return;
@@ -335,27 +386,18 @@ namespace sdr::mdm
           if (ccfg.p34)                 // Rate 3/4?
             ph=(ph+1)%3;                // Advance puncturing phase
         }                               // Done processing channel bits
-        std::vector<uint8_t> urev{};    // Reversed input bits
-        Traceback(&urev);               // Perform traceback
-        o->assign(urev.rbegin(),urev.rend());// Assign in forward order
+        if (rel!=nullptr)               // Soft output requested?
+          TracebackSova(o,rel,30);      // SOVA: hard bits + per-bit reliability, forward order
+        else                            // Hard output only
+        {                               // Classic MLSE traceback
+          std::vector<uint8_t> urev{};  // Reversed input bits
+          Traceback(&urev);             // Perform traceback
+          o->assign(urev.rbegin(),urev.rend());// Assign in forward order
+        }                               // Done producing output
         //Log("[END] Viterbi DecodeBitsWeighted: output input bits=%zu",o->size());
-      }
-    private:
-      ConvConfig ccfg{};                // Convolutional Codec conf parameters
-      int ph{0};                        // Puncturing phase counter
-      static constexpr uint16_t INF=0x3FFFu;// big and safe for short frames
-      static constexpr uint16_t BM_SCALE=256u; // Branch metric scaling factor
-      uint16_t pm[64]{};                 // Path metrics
-      size_t steps{0};                  // Number of steps Viterbi has gone through
-      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-      // Survivor paths: one row per step, 64 colums (state)
-      // Each row stores predecessor state and the input bit taken to enter that state
-      // and lead us to that path at that step.
-      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-      std::vector<std::array<uint8_t,64>> prev{}; // Survivor paths
-      std::vector<std::array<uint8_t,64>> bit{};  // Input bits
-      // Log object
-            // ~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      }                                 // ~~~~~~~~~~ DecodeBitsWeighted ~~~~~~~~~~ //
+    public:
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~ //
       // Trellis structure for Viterbi Decoder
       // ~~~~~~~~~~~~~~~~~~~~~~~~~ //
       struct TrellisNode
@@ -479,7 +521,27 @@ namespace sdr::mdm
             }                           // Done for each input bit
           }                             // Done for each state
         }                               // ~~~~~~~~~~ Print ~~~~~~~~~~ //        
-      } trellis{};
+      } trellis{};      
+    private:
+      ConvConfig ccfg{};                // Convolutional Codec conf parameters
+      int ph{0};                        // Puncturing phase counter
+      static constexpr uint16_t INF=0x3FFFu;// big and safe for short frames
+      static constexpr uint16_t BM_SCALE=256u; // Branch metric scaling factor
+      static constexpr float BM_SCALE_F32=static_cast<float>(BM_SCALE);
+      uint16_t pm[64]{};                 // Path metrics
+      size_t steps{0};                  // Number of steps Viterbi has gone through
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Survivor paths: one row per step, 64 colums (state)
+      // Each row stores predecessor state and the input bit taken to enter that state
+      // and lead us to that path at that step.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      std::vector<std::array<uint8_t,64>> prev{};   // Survivor paths
+      std::vector<std::array<uint8_t,64>> bit{};    // Input bits
+      std::vector<std::array<uint16_t,64>> dmarg{}; // SOVA: ACS margin Delta per step/state
+      std::vector<std::array<uint8_t,64>> prevc{};  // SOVA: competitor predecessor state
+      std::vector<std::array<uint8_t,64>> bitc{};   // SOVA: competitor input bit
+      // Log object
+
       // One ACS (Add path weights, Compare, Select best path) step
       inline void ViterbiStep (
         uint8_t r1,                     // Received parity bit 1
@@ -567,6 +629,52 @@ namespace sdr::mdm
         //if (lg)
         //  //Deb(" [END] ViterbiStep: Completed step %zu",steps);
       }                                 // ~~~~~~~~~~ ViterbiStep ~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // DecodeBitsWeighted ? Soft-Decision (Soft-Input) Viterbi, and the road to SOVA.
+      //
+      // THEORY
+      //   Classic Viterbi is Maximum-Likelihood Sequence Estimation (MLSE): it finds
+      //   the single trellis path  u_hat = argmax_u P(r|u), minimizing the FRAME
+      //   (sequence) error probability. It uses hard bits + a Hamming branch metric
+      //   and emits a hard survivor with NO per-bit confidence.
+      //
+      //   This routine is the SOFT-INPUT variant. Each received bit carries a weight
+      //   w in [0,1] (channel reliability) and the branch metric is a weighted
+      //   mismatch COST (lower = better):
+      //        BM(s->ns) = sum_i  w_i * [ c_i(s,ns) != r_i ]
+      //   an unreliable bit (w->0) barely moves the path metric. This beats hard
+      //   Viterbi (it exploits the analog margin) but the criterion is UNCHANGED:
+      //   still MLSE, still a HARD output.
+      //
+      //   SOVA (Soft-Output Viterbi Algorithm, Hagenauer & Hoeher 1989) bolts a
+      //   per-bit RELIABILITY onto the MLSE survivor, making Viterbi Soft-In/Soft-Out
+      //   (SISO). At every ACS merge the discarded competitor has metric M_comp and
+      //   the survivor M_surv; their margin
+      //        Delta = M_comp - M_surv >= 0
+      //   says how nearly the runner-up won. The bit APP magnitude is
+      //        |L(u_k)| ~= min{ Delta_j : competitor at node j disagrees with the
+      //                                   survivor on bit k },   sign(L)=hard decision.
+      //   A small Delta at a node where the two paths disagree on bit k => bit k is
+      //   unreliable.
+      //
+      //   RELATION TO BCJR (MAP): BCJR marginalizes over ALL paths (forward-backward)
+      //   for the EXACT per-bit APP LLR and minimizes BIT error probability. SOVA
+      //   keeps only the single best competitor, so it is a max-log-MAP-style
+      //   approximation:  |L_SOVA| <= |L_BCJR|  (~0.5 dB weaker in iterative use),
+      //   at ~2x hard-Viterbi cost vs BCJR's ~3-4x plus whole-block memory.
+      //
+      //     |                | criterion      | output      | cost        |
+      //     | Viterbi (hard) | MLSE (seq)     | hard        | 1x          |
+      //     | this (soft-in) | MLSE (seq)     | hard        | ~1x         |
+      //     | SOVA           | MLSE + reliab. | hard + LLR  | ~2x         |
+      //     | BCJR (MAP)     | MAP (per-bit)  | exact LLR   | ~3-4x + mem |
+      //
+      //   STATUS: as written this is soft-IN / hard-OUT (SDVA), NOT SOVA ? it emits
+      //   no reliability. To make it SOVA, capture the ACS margin Delta per node and
+      //   run the reliability-update pass (see TracebackSova). If you only need soft
+      //   output for the RS/frame-confidence path, BCJRDecoder already gives exact
+      //   LLRs and is the better choice.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //      
       inline void ViterbiStepWeighted (
         uint8_t r1,                     // Received parity bit 1
         uint8_t r2,                     // Received parity bit 2
@@ -575,61 +683,87 @@ namespace sdr::mdm
         float w1,                       // Weight for parity bit 1
         float w2)                       // Weight for parity bit 2
       {                                 // ~~~~~~~~~~ ViterbiStepWeighted ~~~~~~~~~~ //
-       // if (lg)
-       //   //Deb(" [BEGIN] ViterbiStepWeighted: r1=%d r2=%d isp1=%d isp2=%d w1=%.2f w2=%.2f",
-        //    r1,r2,isp1,isp2,w1,w2);
-        uint16_t qm[64];                // New path metrics
-        std::fill(std::begin(qm),std::end(qm),INF);// Init to Inf
-        uint8_t ps[64]{};               // Predecessor state (prev row)
-        uint8_t ib[64]{};               // Input bit that led to this survivor state.
-        const uint16_t w1s=static_cast<uint16_t>(std::clamp(w1,0.f,1.f)*BM_SCALE+0.5f);// Scaled weight 1
-        const uint16_t w2s=static_cast<uint16_t>(std::clamp(w2,0.f,1.f)*BM_SCALE+0.5f);// Scaled weight
-        for (int s=0;s<64;++s)          // For each state...
-        {
+        uint16_t qm[64];                // Best path metrics
+        std::fill(std::begin(qm),std::end(qm),INF); // Init new path metrics to Inf
+        uint16_t qm2[64];               // Best path metrics 2 for competitor (SOVA)
+        std::fill(std::begin(qm2),std::end(qm2),INF); // Init new path metrics to Inf
+        uint8_t ps[64]{};               // Survivor predecessor states
+        uint8_t ib[64]{};               // Survivor input bits
+        uint8_t psc[64]{};              // Competitor predecessor states (SOVA)
+        uint8_t ibc[64]{};              // Competitor input bits (SOVA)
+        const uint16_t w1s=static_cast<uint16_t>(std::clamp(w1,0.f,1.f)*BM_SCALE+0.5f); // Scaled weight for bit 1
+        const uint16_t w2s=static_cast<uint16_t>(std::clamp(w2,0.f,1.f)*BM_SCALE+0.5f); // Scaled weight for bit 2
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // For each state, compute branch metrics for input bits 0 and 1
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int s=0;s<64;++s)          // For each state
+        {                               // Viterbi add path wieghts, compare and select best path
           const uint16_t base=pm[s];    // Base path metric for this state
           if (base>=INF)                // Invalid path?
             continue;                   // Skip it
           for (int b=0;b<2;++b)         // For each input bit
-          {
-            const int ns=static_cast<int>(trellis.GetNext(s,b)[0]);// Next state
-            const uint8_t* e1=trellis.GetOut(s,b,0);// Output bits for this input
-            const uint8_t* e2=trellis.GetOut(s,b,1);// Output bits for this input
-            // ~~~~~~~~~~~~~~~~~~~~~~~~ //
-            // Compute weighted branch metric from received bits to expected output bits
-            // ~~~~~~~~~~~~~~~~~~~~~~~~ //
+          {                             // Walk trellis
+            const int ns=static_cast<int>(trellis.GetNext(s,b)[0]); // Next state
+            const uint8_t* e1=trellis.GetOut(s,b,0); // Expected output bits for this input
+            const uint8_t* e2=trellis.GetOut(s,b,1); // Expected output bits for this input
             uint16_t bm{0};             // Branch metric
-            if (isp1!=0)                // Parity bit present?
-            bm+=((*e1!=r1)?w1s:0);      // Add weighted branch metric
-            if (isp2!=0)                // Parity bit present?
-              bm+=((*e2!=r2)?w2s:0);    // Add weighted branch metric
-            const uint16_t npm=static_cast<uint16_t>(std::min<uint32_t>(INF,base+bm));// New path metric
-            if (npm<qm[ns])             // Better path?
-            {                           // Yes, so update optimal path
-              qm[ns]=npm;               // Update path metric
-              ps[ns]=static_cast<uint8_t>(s);// Store predecessor state
-              ib[ns]=static_cast<uint8_t>(b);// Store input bit that led to this state
-             // if (lg)
-             //   //Deb(" ViterbiStepWeighted: Update State %02X New PM=%d Prev State %02X Input Bit %d",
-             //     ns,npm,s,b);
-            }                           // Done updating optimal path
+            if (isp1!=0)                // Parity bit 1 present?
+              bm+=((*e1!=r1)?w1s:0);    // Add scaled weight if bit mismatch
+            if (isp2!=0)                // Parity bit 2 present?
+              bm+=((*e2!=r2)?w2s:0);    // Add scaled weight if bit mismatch
+            const uint16_t npm=static_cast<uint16_t>(std::min<uint32_t>(INF,base+bm)); // New path metric
+            if (npm<qm[ns])             // Better path metric for next state?
+            {                           // Yes: new survivor, old survivor demotes to competitor
+              qm2[ns]=qm[ns];           // Old best becomes the competitor metric
+              psc[ns]=ps[ns];           // Old survivor predecessor becomes competitor predecessor
+              ibc[ns]=ib[ns];           // Old survivor input bit becomes competitor input bit
+              qm[ns]=npm;               // Update best (survivor) path metric
+              ps[ns]=static_cast<uint8_t>(s); // Survivor predecessor STATE (not a metric)
+              ib[ns]=static_cast<uint8_t>(b); // Update survivor input bit
+            }                           // Done updating survivor
+            else if (npm<qm2[ns])       // Else bettern than competitor?
+            {                           // Update new competitor
+              qm2[ns]=npm;              // Update competitor path metric
+              psc[ns]=static_cast<uint8_t>(s); // Update competitor predecessor state
+              ibc[ns]=static_cast<uint8_t>(b); // Update competitor input bit
+            }                           // Done updating competitor
+            else                        // NO OP IT
+            {                           // Competitor not better than survivor, do nothing
+              // NO-OP
+            }                           // Done comparing with survivor and competitor
           }                             // Done for each input bit
         }                               // Done for each state
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        // Commit new metrics and push survivors for traceback
+        // Commit new path metrics and push survivors for traceback
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
         for (int s=0;s<64;++s)          // For each state
-          pm[s]=qm[s];                  // Commit new path metric
+          pm[s]=qm[s];                  // Commit new path metric with best path metric
         prev.emplace_back();            // Add new row for predecessor states
         bit.emplace_back();             // Add new row for input bits
+        dmarg.emplace_back();           // Add new row for SOVA margins
+        prevc.emplace_back();           // Add new row for SOVA competitor predecessor states
+        bitc.emplace_back();            // Add new row for SOVA competitor input bits
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Update survivor and competitor storage for traceback
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
         for (int s=0;s<64;++s)          // For each state
-        {                               // Store last step survivors and input bits
-          prev.back()[s]=ps[s];         // Predecessor state
-          bit.back()[s]=ib[s];          // Input bit that led to this state
+        {                               // Store survivor and competitor info for this step/state
+          prev.back()[s]=ps[s];         // Survivor predecessor state
+          bit.back()[s]=ib[s];          // Survivor input bit that led to THIS state
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          // Compute SOVA margin delta = competitor - survivor (>=0). If either
+          // path is invalid (no competitor merged), the margin is INF (certain).
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          const uint16_t d=(qm[s]>=INF||qm2[s]>=INF)?INF:static_cast<uint16_t>(qm2[s]-qm[s]); // Competitor margin
+          dmarg.back()[s]=d;            // Store SOVA margin for this step/state
+          prevc.back()[s]=psc[s];       // Store competitor predecessor state
+          bitc.back()[s]=ibc[s];        // Store competitor input bit
         }                               // Done for each state
         ++steps;                        // Advance number of steps
-       // if (lg)
-       //   //Deb(" [END] ViterbiStepWeighted: Completed step %zu",steps);
       }                                 // ~~~~~~~~~~ ViterbiStepWeighted ~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Traceback to find best path through trellis and output decoded bits in reverse order
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
       inline void Traceback (
         std::vector<uint8_t>* const urev) // Reversed output bits
       {                                 // ~~~~~~~~~~ Traceback ~~~~~~~~~~~~ //
@@ -675,7 +809,253 @@ namespace sdr::mdm
           //  //Deb(" [END] Viterbi Traceback: Step %d Current State %02X Input Bit %d Predecessor State %02X",
           //    t,ste,u,ps);
         }                               // Done for all steps
-      }
+      }                                 // ~~~~~~~~~~ Traceback ~~~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // SOVA reliability update pass: after traceback, we have the survivor path and its decisions
+      // for all steps. For each step, we can look at the competitor path that lost at that step and see if it disagreed with the survivor on the decoded bit. If so,
+      // we can compute the metric difference Delta between the survivor and competitor at that step and use it to update the reliability of the decoded bit. The larger the Delta, the more reliable the decoded bit is (the more the survivor won by).
+      // U controls how many steps to look back for reliability updates: U=0 means only the last bit, U=1 means the last two bits, and so on, up to U
+      // =steps means all bits. In practice, a small U (e.g. 5-10) may be sufficient to capture most of the reliability information while keeping complexity manageable.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline void TracebackSova (
+        std::vector<uint8_t>* out,      // Output decoded bits (0/1)
+        std::vector<float>* rel,        // Output reliability for decoded bits (L>0 favors bit 0, L<0 favors bit 1)
+        int U=30)                       // Traceback depth for reliability update (0=only last bit, U=all bits)
+      {                                 // ~~~~~~~~~~ TracebackSova ~~~~~~~~~~ //
+        if (out==nullptr)               // Bad args?
+          return;                       // Nothing to do
+        out->clear();                   // Clear output bits buffer
+        if (rel!=nullptr)               // We have reliability buffer?
+          rel->clear();                 // Clear reliability buffer
+        if (steps==0) return;           // No steps, nothing to do
+        uint16_t bstm=INF;              // Best path metric
+        int bsts=0;                     // Final state with best path metric
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Find the best path metric
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int s=0;s<64;++s)          // For each state
+        {                               // Find best path metric
+          if (pm[s]<bstm)               // Do we have a better path metric?
+          {                             // Yes
+            bstm=pm[s];                 // Update best path metric
+            bsts=s;                     // Update best state
+          }                             // Done checking this state
+        }                               // Done for all states
+        const int tst=static_cast<int>(steps);// Total number of steps
+        std::vector<int> mls(tst);      // Maximum-Likelihood state per time (fwd)
+        std::vector<uint8_t> mlb(tst);  // Maximum-Likelihood bit per time 
+        {                               // Lock scope scope for ML path computation
+          int s=bsts;                   // Start from best state at end
+          for (int t=tst-1;t>=0;--t)    // For each step in the diagram, backwards
+          {                             // Trace back survivor path to find ML decisions and states
+            mls[static_cast<size_t>(t)]=s; // Store ML state at this time
+            mlb[static_cast<size_t>(t)]=bit[static_cast<size_t>(t)][s]; // Store ML bit at this time
+            s=prev[static_cast<size_t>(t)][s]; // Move to predecessor state
+          }                             // Done tracing back survivor path
+        }                               // Done with ML path computation
+        std::vector<uint16_t> ell(tst,INF); // Relaibility L (cost metric units)
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Compute reliability for each decision
+        // along the survivor path by looking
+        // at the competitor path that lost to the survivor
+        // at each time step.
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int t=tst-1;t>=0;--t)      // For each step in the diagram, backwards
+        {                               // Compute reliability for ML decision at THIS time
+          size_t idx=static_cast<size_t>(t); // Index for current time step
+          const int s=mls[idx];         // ML state at this time
+          const uint16_t d=dmarg[idx][s]; // Metric margin for ML path at this time
+          if (d>=INF)                   // Invalid margin?
+            continue;                   // Skip reliability update for this time
+          if (bitc[idx][s]!=mlb[idx])   // Competitor bit disagrees with ML bit?
+            ell[idx]=std::min<uint16_t>(ell[idx],d); // Update reliability metric for this time
+          int cs=prevc[idx][s];         // Competitor state at this time
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          // Trace back competitor path for U steps
+          // or until path re-merges with survivor path,
+          // whichever comes first, and update reliability for any disagreements
+          // along the way.
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          for (int i=t-1;i>=0&&i>=t-U;--i) // For previous U steps
+          {                             // Walk competitor back through trellisto the re-merge
+            if (cs==mls[i])             // Paths have re-merged by this time?
+              break;                    // Done with this competitor path
+            if (bit[i][cs]!=mlb[i])     // Competitor bit disagrees with ML bit?
+              ell[idx]=std::min<uint16_t>(ell[idx],d); // Update reliability metric for this time
+            cs=prev[static_cast<size_t>(i)][cs]; // Move competitor to predecessor state
+          }                             // Done walking to prev U states
+        }                               // Done with this time step
+        out->resize(tst);               // Resize output bits buffer
+        if (rel!=nullptr)               // We have reliability buffer?
+          rel->resize(tst);             // Resize reliability buffer
+        for (int t=0;t<tst;++t)         // For each time step
+        {                               // Recollect maximally likely determined bits
+          size_t idx=static_cast<size_t>(t); // Index for this time step
+          (*out)[idx]=mlb[idx];         // Output ML bit for this time step
+          if (rel!=nullptr)             // We have a reliabilty buffer?
+          {                             // Yes
+            const float r=(ell[idx])/BM_SCALE_F32; // Get reliability |LLR|
+            (*rel)[idx]=r;              // Output reliability for this time step
+          }                             // Done with this time step
+        }                               // Done for each time step
+      }                                 // ~~~~~~~~~~ TracebackSova ~~~~~~~~~~ //
 
+
+  };
+  // ************************************************************************* //
+  // BCJR Decoder class: Uses the same CCSDS K=7 rate 1/2 inner code.
+  // Convention: coded LLR L = log P(bit=0)/P(bit=1) (L>0 favors bit 0)
+  // Free non-terminated endpoint trellis: start state is known (0), end free.
+  // ************************************************************************* //
+  class BCJRDecoder
+  {
+    public:
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // BCJR Decoder LLR and decision struct
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      static constexpr float negeps=-1e30f; // Very negative LLR
+      struct LLR
+      {
+        std::vector<float> lc1{};       // LLR of coded bit 1 per step (C1)
+        std::vector<float> lc2{};       // LLR of coded bit 2 per step (C2)
+        std::vector<uint8_t>* out{};    // Decision input bits (0/1 hard-bits)
+        std::vector<float>* llr{};      // A-posteriori probability LLR for decoded bits (L>0 favors bit 0)
+        inline void Clear (void)
+        {
+          lc1.clear();                  // Clear LLR for coded bit 1
+          lc2.clear();                  // Clear LLR for coded bit 2
+          if (out!=nullptr)             // We have output decoded bits?
+            out->clear();               // Clear output decoded bits
+          if (llr!=nullptr)             // We have output LLR for decoded bits?
+            llr->clear();               // Clear output LLR for decoded bits
+        }
+      };
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Constructor: builds trellis structure
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      BCJRDecoder (void)
+      {                                 // ~~~~~~~~~~ ctor ~~~~~~~~~~ //
+        trellis.BuildTrellis();         // Build trellis diagram structure
+      }                                 // ~~~~~~~~~~ ctor ~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // lc1,lc2: Channel LLRs for the coded bits of each info step.
+      //          For punctured/erased symbols pass 0.0f (no information)
+      //          C2 carries the CCSDS G2 inversion: flip sign of lc2 before calling,
+      //          or pass it pre-flipped, to match the inverted-C2 trellis expectations.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline void Decode (const LLR& l)
+      {
+        if (l.out==nullptr||l.llr==nullptr) // No output decoding decisions, or APP LLR buffer?
+          return;                       // Nothing to do
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Prepare output buffers
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        const int N=static_cast<int>(std::min(l.lc1.size(),l.lc2.size()));
+        if (N==0) return;               // No input LLRs, nothing to do
+        l.out->assign(N,0);             // Clear output decoded bits
+        l.llr->assign(N,0.f);           // Clear output LLR for decoded bits
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // alpha[t][s], beta[t][s], t in [0..N]
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        std::vector<std::array<float,64>> a(N+1),b(N+1); // Forward and backward state metrics
+        for (int t=0;t<=N;++t)          // For the number of steps....
+        {                               // Init forward and backward metrics...
+          a[t].fill(negeps);            // Init forward metrics to very negative
+          b[t].fill(negeps);            // Init backward metrics to very negative
+        }                               // Done initializing metrics
+        a[0][0]=0.f;                    // Start state known, so forward metric is 0 for state 0
+        for (int s=0;s<64;++s)          // Free end
+          b[N][s]=0.f;                  // so backward metric is 0 for all states at end
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Gamma(s,b) at step t is defined by:
+        //  0.5*(x1*lc1 + x2*lc2), x+=1 for bit 0, -1 for bit 1
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        auto gamma=[&](int t, int s, int bb)->float
+        {
+          int ns=0;                     // Next state for this transition
+          int ob=0;                     // Output bits for this transition
+          trellis.Get(s,bb,ns,ob);      // Get next state and output
+          (void)ns;                     // Don't need it anymore (want to reuse trellis call)
+          const uint8_t* e1=trellis.GetOut(s,bb,0); // Output bit 1 for this transition
+          const uint8_t* e2=trellis.GetOut(s,bb,1); // Output bit 2 for this transition
+          const float x1=(*e1==0)?1.f:-1.f; // Map expected bit output to +1 for bit 0, -1 for bit 1
+          const float x2=(*e2==0)?1.f:-1.f; // Map expected bit output to +1 for bit 0, -1 for bit 1
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          // A-priori on u assumed 0
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          return 0.5f*(x1*l.lc1[t]+x2*l.lc2[t]); // Return gamma metric for this transition
+        };                              // Done gamma lambda function
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Forward recursion: compute alpha[t][s] for t in [1..N]
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int t=0;t<N;++t)           // For each step
+        {                               // (explicit braces: this block is its own pass)
+          for (int s=0;s<64;++s)        // For each state
+          {
+            if (a[t][s]<=negeps)        // Invalid path?
+              continue;                 // Skip it
+            for (int bb=0;bb<2;++bb)    // For each input bit
+            {                           // compute alpha
+              const int ns=static_cast<int>(trellis.GetNext(s,bb)[0]); // Next state for THIS transition
+              const float m=a[t][s]+gamma(t,s,bb); // Metric for this transition
+              if (m>a[t+1][ns])         // Better path to next state?
+                a[t+1][ns]=m;           // Max-Log alpha update
+            }                           // Done for each input bit
+          }                             // Done for each state
+        }                               // Done forward recursion
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Backward recursion: compute beta[t][s] for t in [N-1..0]
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int t=N-1;t>=0;--t)        // For each step (backwards)
+        {                               // (explicit braces: this block is its own pass)
+          for (int s=0;s<64;++s)        // For each state
+          {                             // compute beta
+            for (int bb=0;bb<2;++bb)    // For each input bit
+            {                           // compute beta
+              const int ns=static_cast<int>(trellis.GetNext(s,bb)[0]); // Next state for THIS transition
+              const float m=b[t+1][ns]+gamma(t,s,bb); // Metric for this transition
+              if (m>b[t][s])            // Better path from this state?
+                b[t][s]=m;              // Max-Log beta update
+            }                           // Done for each input bit
+          }                             // Done for each state
+        }                               // Done backward recursion
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // A-Posteriori Probability per info bit
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int t=0;t<N;++t)           // For each step
+        {                               // Compute APP LLR for this step
+          float m0=negeps;              // Metric for u=0
+          float m1=negeps;              // Metric for u=1
+          for (int s=0;s<64;++s)        // For each state
+          {                             // Compute contribution to APP LLR for this state
+            if (a[t][s]<=negeps)        // Invalid path?
+              continue;                 // Skip it
+            for (int bb=0;bb<2;++bb)    // For each input
+            {                           // bit
+              const int ns=static_cast<int>(trellis.GetNext(s,bb)[0]); // Next state for THIS transition
+              const float m=a[t][s]+gamma(t,s,bb)+b[t+1][ns]; // Metric for this transition
+              if (bb==0)                // Input bit 0?
+              {                         // Better path?
+                if (m>m0)               // Better path for u=0?
+                  m0=m;                 // Update metric for u=0
+              }                         // Done for input bit 0
+              else                      // Input bit 1?
+              {                         // Better path?
+                if (m>m1)               // Better path for u=1?
+                  m1=m;                 // Update metric for u=1
+              }                         // Done for input bit 1
+            }                           // Done for each input bit
+          }                             // Done for each state
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          // Log P(u=0)/P(u=1) = log sum exp for u=0 - log sum exp for u=1
+          // Max-Log approximation: log sum exp(x_i) ~ max(x_i)
+          // ~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+          const float Lk=m0-m1;         // LLR for this bit
+          (*l.llr)[static_cast<size_t>(t)]=Lk; // Store LLR for this bit
+          (*l.out)[static_cast<size_t>(t)]=(Lk>=0.f)?0:1; // Make hard decision for this bit
+        }                               // Done computing APP LLR and decisions for each bit
+      }                                 // ~~~~~~~~~~ Decode ~~~~~~~~~~ //
+    private:
+      ViterbiDecoder::TrellisNode trellis{};
   };
 }
