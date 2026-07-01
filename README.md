@@ -1,10 +1,10 @@
 # CCSDSViterbi
 
-A high-performance C++ implementation of the CCSDS (Consultative Committee for Space Data Systems) standard Rate 1/2 and Rate 3/4 Convolutional Encoder with Viterbi Decoder, implementing CCSDS-131.[..[...
+A high-performance C++ implementation of the CCSDS (Consultative Committee for Space Data Systems) standard Rate 1/2 and Rate 3/4 Convolutional Encoder with Viterbi Decoder, implementing CCSDS-131.[..[...]
 
 ## Overview
 
-This library provides production-grade implementations of convolutional encoding and maximum-likelihood sequence estimation (Viterbi) decoding for satellite and deep-space communications. The imple[..[...
+This library provides production-grade implementations of convolutional encoding and maximum-likelihood sequence estimation (Viterbi) decoding for satellite and deep-space communications. The imple[..[...]
 
 ## Mathematical Foundation
 
@@ -87,7 +87,7 @@ Any equivalent metric differing only by additive/scale constants preserves survi
 
 With trellis state $s$ at stage $k$:
 
-$$M_k(s)=\min_{b\in\mathcal{B}(s)}\left\{M_{k-1}(s')+\gamma_k(b)\right\}$$
+$$M_k(s)=\min_{b\in\mathcal{B}(s)}\{M_{k-1}(s')+\gamma_k(b)\}$$
 
 where $\mathcal{B}(s)$ is the set of branches entering state $s$, and $s'$ is the predecessor for branch $b$.
 
