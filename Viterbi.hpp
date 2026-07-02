@@ -10,8 +10,6 @@
 * * Author:
 * *   JEP, J. Enrique Peraza
 * *
-* * Organization:
-* *   Trivium Solutions LLC, 9175 Guilford Rd, Suite 220, Columbia, MD 21046
 * *
 */
 ///NOTE: G2 OUTPUT INVERSION (CCSDS 131.0-B-5 sec 3.3.1(5)) is applied and removed
