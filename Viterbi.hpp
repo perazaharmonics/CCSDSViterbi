@@ -634,7 +634,7 @@ namespace sdr::mdm
         {                               // Yes
          for (int s=0;s<64;++s)         // For each state
            if (pm[s]<INF)               // Valid path (not the sentinnel)?
-             pm[s]=static_cast<pm[s]-mn); // Yes, slide the whole metric floor.
+             pm[s]=static_cast<uint16_t>(pm[s]-mn); // Yes, slide the whole metric floor.
         }                               // Done sliding metric floor.
         prev.emplace_back();            // Add new row for predecessor states
         bit.emplace_back();             // Add new row for input bits
