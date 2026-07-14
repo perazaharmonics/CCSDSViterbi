@@ -712,7 +712,7 @@ namespace sdr::mdm
         for (int s=0;s<64;++s)          // For each state
         {                               // Commit and track min
           pm[s]=qm[s];                  // Commit new path metric with best path metric
-          if (pm[s]<qm[s])              // New min?
+          if (pm[s]<mn)                 // New min?
             mn=pm[s];                   // Yes, store that.
         }                               // Done committing
         if (mn>0u&&mn<INF)              // Anything to subtract and valid path metric?
