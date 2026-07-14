@@ -302,9 +302,10 @@ namespace sdr::mdm
       //     llr -> signed classic-SOVA soft output L = sign(u_k)*|L|, L>0 favors
       //            bit 0 / L<0 favors bit 1 (same convention as BCJRDecoder, so it
       //            drops straight into the RS/frame-confidence path).
-      //   Leave both nullptr (default) for the classic soft-IN / hard-OUT MLSE
-      //   traceback. Note there is no path-metric renormalization, so drive short
-      //   frames only. If you need the EXACT per-bit APP LLR, BCJRDecoder remains the
+      //   + per-bit |L|, units of cost/BM_SCALE); pass rel == nullptr (default) for
+      //   the classic soft-IN / hard-OUT MLSE traceback. Path metrics ARE
+      //   renormalized every step (the minimum survivor is slid to zero), so
+      //   frames of any length are safe. If you need the EXACT per-bit APP LLR, BCJRDecoder remains the
       //   better choice (SOVA's |L| is a max-log-MAP approximation, |L_SOVA| <= |L_BCJR|).
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //      
       inline void DecodeBitsWeighted (
@@ -620,10 +621,21 @@ namespace sdr::mdm
           }                             // Done for each input bit
         }                               // Done for each state
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        // Commit new metrics and push survivors for traceback
+        // Comment and renormalize.
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        uint16_t mn=INF;                // Running minimum over valid survivors
         for (int s=0;s<64;++s)          // For each state
-          pm[s]=qm[s];                  // Commit new path metric
+        {                               // Commit and track minimum
+         pm[s]=qm[s];                   // Commit new path metric
+         if (pm[s]<mn)                  // New minimum
+           mn=pm[s];                    // Yes so save it
+        }                               // Done commit
+        if (mn>0u&&mn<INF)              // Anything to subtract and valid path metric?
+        {                               // Yes
+         for (int s=0;s<64;++s)         // For each state
+           if (pm[s]<INF)               // Valid path (not the sentinnel)?
+             pm[s]=static_cast<pm[s]-mn); // Yes, slide the whole metric floor.
+        }                               // Done sliding metric floor.
         prev.emplace_back();            // Add new row for predecessor states
         bit.emplace_back();             // Add new row for input bits
         for (int s=0;s<64;++s)          // For each state
@@ -696,8 +708,19 @@ namespace sdr::mdm
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
         // Commit new path metrics and push survivors for traceback
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        uint16_t mn=INF;                // Running minumum over valid survivors
         for (int s=0;s<64;++s)          // For each state
+        {                               // Commit and track min
           pm[s]=qm[s];                  // Commit new path metric with best path metric
+          if (pm[s]<qm[s])              // New min?
+            mn=pm[s];                   // Yes, store that.
+        }                               // Done committing
+        if (mn>0u&&mn<INF)              // Anything to subtract and valid path metric?
+        {                               // Yes
+          for (int s=0;s<64;++s)        // For each state
+            if (pm[s]<INF)              // Valid path?
+              pm[s]=static_cast<uint16_t>(pm[s]-mn); // Slide the whole metric floor
+        }
         prev.emplace_back();            // Add new row for predecessor states
         bit.emplace_back();             // Add new row for input bits
         dmarg.emplace_back();           // Add new row for SOVA margins
