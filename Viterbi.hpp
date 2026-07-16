@@ -160,6 +160,7 @@ namespace sdr::mdm
         bit.clear();                    // Clear input bits
         dmarg.clear();                  // Clear SOVA margins
         prevc.clear();                  // Clear SOVA competitor predecessors
+        emitted=0u;                     // Clear emitted rows history
         bitc.clear();                   // Clear SOVA competitor input bits
       }                                 // ~~~~~~~~~~ Reset ~~~~~~~~~~ //
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
@@ -244,18 +245,15 @@ namespace sdr::mdm
             ph=(ph+1)%3;                // Advance puncturing phase
         }                               // Done processing channel bits
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        // Traceback to find best path
-        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        std::vector<uint8_t> urev{};    // Reversed input bits
-        Traceback(&urev);               // Perform traceback
-        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        // Output in forward order
-        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-        o->assign(urev.rbegin(),urev.rend());// Assign in forward order
-        //Log("[END] Viterbi DecodeBits: output input bits=%zu",o->size());
+        // Sliding window drain: emit every decision older than TBWIN and drop
+        // those rows. This is to bound memory and emit each informationn bit
+        // exactly once across succesive calls (no-remission of history).
+        // Call Flush() at stream end to emit the retained call.
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        DrainWindow(o,false);           // Not the final flush: keep a TBWIN tail.
       }                                 // ~~~~~~~~~~ DecodeBits ~~~~~~~~~~ //
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
-      // DecodeBitsWeighted — Soft-Decision (Soft-Input) Viterbi, and the road to SOVA.
+      // DecodeBitsWeighted  Soft-Decision (Soft-Input) Viterbi, and the road to SOVA.
       //
       // THEORY
       //   Classic Viterbi is Maximum-Likelihood Sequence Estimation (MLSE): it finds
@@ -393,16 +391,40 @@ namespace sdr::mdm
           if (ccfg.p34)                 // Rate 3/4?
             ph=(ph+1)%3;                // Advance puncturing phase
         }                               // Done processing channel bits
-        if (rel!=nullptr||llr!=nullptr) // Soft output requested (magnitude and/or signed LLR)?
-          TracebackSova(o,rel,30,llr);  // SOVA: hard bits + reliability |L| and/or signed LLR, forward order
-        else                            // Hard output only
-        {                               // Classic MLSE traceback
-          std::vector<uint8_t> urev{};  // Reversed input bits
-          Traceback(&urev);             // Perform traceback
-          o->assign(urev.rbegin(),urev.rend());// Assign in forward order
-        }                               // Done producing output
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // Sliding window drain. The SOVA path drains through DrainWindowSova
+        // so the reliability update never reads dropped rows.
+        // Call Flush() at stream end to emit the retained tail
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        if (rel!=nullptr||llr!=nullptr) // Soft output requested?
+          DrainWindowSova(o,rel,llr,false); // Not the final flush
+        else                            // We are outputing hard bits
+          DrainWindow(o,false);         // Not the final flush.
         //Log("[END] Viterbi DecodeBitsWeighted: output input bits=%zu",o->size());
       }                                 // ~~~~~~~~~~ DecodeBitsWeighted ~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Flush the decoder at stream end. Emit every remaining hold decision and 
+      // empty the history. Call once, when no more channel bits will arrive
+      // (e.g. end of a contact / DIFI CTX reset). The middle of the stream must
+      // NOT be flushed as that would emit the tail early, at a reduced reliability
+      // metric. Hard flush -> rel=llr=nullptr; SOVA flush would pass either.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline void Flush (
+        std::vector<uint8_t>* const o,  // Output remaining decoded bits, forward order
+        std::vector<float>* const rel=nullptr, // Optional reliability, |L|
+        std::vector<float>* llr=nullptr) // Optional signed SOVA LLR
+      {                                 // ~~~~~~~~~~~~~ Flush ~~~~~~~~~~~~~~ //
+        if (o==nullptr)                 // No sink?
+          return;                       // Nothing to do
+        if (rel!=nullptr||llr!=nullptr) // Soft flushing?
+          DrainWindowSova(o,rel,llr,true); // Emit everything SOVA
+        else                            // Hard flush
+          DrainWindow(o,true);          // Emit everything, hard
+      }                                 // ~~~~~~~~~~~~~ Flush ~~~~~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Diagnostic: rows currently held
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline size_t HeldSteps (void) const { return steps; } 
     public:
       // ~~~~~~~~~~~~~~~~~~~~~~~~~ //
       // Trellis structure for Viterbi Decoder
@@ -535,8 +557,19 @@ namespace sdr::mdm
       static constexpr uint16_t INF=0x3FFFu;// big and safe for short frames
       static constexpr uint16_t BM_SCALE=256u; // Branch metric scaling factor
       static constexpr float BM_SCALE_F32=static_cast<float>(BM_SCALE);
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // SOVA reliability cap. A windowed drain that finds no diagreeing competitor
+      // within the held buffer leaves ell=INF, which would emit a
+      // spuriour ~64.0 spike relative to full block decode. So we cap |L| at
+      // a value consistent with a fully-reliable bit at the branch metric scale
+      // so the soft output stays bounded and comparable across window
+      // boundaries.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      static constexpr float LMAG_MAX=static_cast<float>(2u*BM_SCALE)/BM_SCALE_F32; // 2.0 cost units
       uint16_t pm[64]{};                 // Path metrics
-      size_t steps{0};                  // Number of steps Viterbi has gone through
+      size_t steps{0};                  // Trellis row kept in history
+      uint64_t emitted{0u};             // Total information bits already emitted downstream
+      static constexpr size_t TBWIN=96u; // Sliding window track depth (>=5*(k-1)=30, 96 just in case)
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
       // Survivor paths: one row per step, 64 colums (state)
       // Each row stores predecessor state and the input bit taken to enter that state
@@ -887,5 +920,149 @@ namespace sdr::mdm
             (*llr)[idx]=(mlb[idx]?-mag:mag); // Classic SOVA LLR: +|L| for bit 0, -|L| for bit 1
         }                               // Done for each time step
       }                                 // ~~~~~~~~~~ TracebackSova ~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Find the current best (minimum path metric) state.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline int BestState (void) const
+      {                                 // ~~~~~~~~~~ BestState ~~~~~~~~~~~~~~ //
+        uint16_t bstm=INF;              // Best path metric so far
+        int bsts=0;                     // State holding it
+        for (int s=0;s<64;++s)          // For each step index
+        {                               // Find new best path metric
+          if (pm[s]<bstm)               // New best path metric found?
+          {                             // Yes
+            bstm=pm[s];                 // Record the metric
+            bsts=s;                     // Save the state
+          }                             // Done setting new best path metric.
+        }                               // Done finding new best path metric
+        return bsts;                    // Return the best state
+      }                                 // ~~~~~~~~~~ BestState ~~~~~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Drop the oldest 'n' trellis rows from every history buffer. Predecessor
+      // entries in the new oldest row point into dropped rows, but that row
+      // becomes a traceback origin. It cannot be a continuation, therefore
+      // those links should never be followed again. Only the row vectors are
+      // trimmed. We decrement 'steps' to match. Doing this bounds memory to 
+      // O(TBWIN).
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline void DropOldestRows (size_t n)
+      {                                 // ~~~~~~~~ DropOldestRows ~~~~~~~~~~~~ //
+        if (n==0u)                      // Any rows to drop?
+          return;                       // Never drop more than we hold
+        if (n>steps)                    // Is requested larger than rows held?
+          n=steps;                      // Yes limit to rows held.
+        prev.erase(prev.begin(),prev.begin()+static_cast<ptrdiff_t>(n));
+        bit.erase(bit.begin(),bit.begin()+static_cast<ptrdiff_t>(n));
+        if (!dmarg.empty())             // SOVA buffer populated?
+        {                               // Yes
+          dmarg.erase(dmarg.begin(),dmarg.begin()+static_cast<ptrdiff_t>(n)); // Drop margin rows
+          prevc.erase(prevc.begin(),prevc.begin()+static_cast<ptrdiff_t>(n)); // Drop competitor pred rows
+          bitc.erase(bitc.begin(),bitc.begin()+static_cast<ptrdiff_t>(n)); // Drop competitor bit rows
+        }                               // Done pruning SOVA buffers
+        steps-=n;                       // History has been pruned N rows
+      }                                 // ~~~~~~~~ DropOldestRows ~~~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Haard output sliding window drain. Traceback the current best state
+      // over all held rows, then emit only the settled prefix (every row except the
+      // most recent TBWIN) in FORWARD order and drop these rows. On the final
+      // flush, the whole buffer is settled: emit all, keep nothing. Each
+      // information bit is emitted exactly once across calls
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline void DrainWindow (
+        std::vector<uint8_t>* const o,  // Output: newly settled decoded bits, fwd order append
+        bool flush)                     // True on stream end: emit every held row
+      {                                 // ~~~~~~~~~~ DrainWindow ~~~~~~~~~~~~~ //
+        if (o==nullptr||steps==0u)      // Nothing to do?
+          return;                       // Return
+        const size_t keep=flush?0u:TBWIN; // Rows to retain as the unsettled tail.
+        if (steps<=keep)                // Enough history to settle any bit yet?
+          return;                       // No, wait for more.
+        const size_t emit=steps-keep;   // Numberof olders rows to settle and emit
+        std::vector<uint8_t> ml(steps); // ML bit per held step (fwd-indexed)
+        int st=BestState();             // ML bit held step (fwd-indexed)
+        const int idx=static_cast<int>(steps)-1; // length of vector
+        for (int t=idx;t>=0;--t)        // Walk whole buffer back
+        {                               // Recover ML decision at step t
+          const size_t ti=static_cast<size_t>(t); // row index
+          ml[ti]=bit[ti][static_cast<size_t>(st)]; // ML input bit at this step
+          st=prev[ti][static_cast<size_t>(st)]; // Move to the predecessor state
+        }                               // Done tracing back
+        for (size_t t=0u;t<emit;++t)    // For each settled step...
+          o->push_back(ml[t]);          // Emit the ML bit (fwd order)
+        emitted+=emit;                  // Account for emitted bits
+        DropOldestRows(emit);           // Phsyically remove the settled rows
+      }                                 // ~~~~~~~~~~ DrainWindow ~~~~~~~~~~~~~ //
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      // Soft-Output (SOVA) sliding-window drain. Same windowing as DrainWindow;
+      // the reliability update runs over the held buffer and only the settled
+      // prefix is emitted. The competitor walk is clamped to the held rows only,
+      // so it'll never see dropped rows. |L| is capped at LMAG_MAX so a windowed
+      // "no competitor found" cannot emit a spurious saturated spike relative
+      // to a full-block decode operation. Function is a fixed-lag SOVA, where |L| is
+      // a bounded approx. of the full block value, following always a safe direction.
+      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+      inline void DrainWindowSova (
+        std::vector<uint8_t>* const o,  // Output decoded bits, fwd order, append
+        std::vector<float>* const rel,  // Output reliability |L|, append (nullptr to skip)
+        std::vector<float>* const llr,  // Output signed SOVA LLR, append (nullptr to skip)
+        bool flush)                     // True on stream end
+      {                                 // ~~~~~~~~~~~ DrainWindowSova ~~~~~~~ //
+        if (o==nullptr||steps==0u)      // Nothing to do?
+          return;                       // return
+        const size_t keep=flush?0u:TBWIN; // Unsettled tail depth
+        if (steps<=keep)                // Not enough history to settle a bit?
+          return;                       // return.
+        const size_t emit=steps-keep;   // How many rows to emit
+        const int tst=static_cast<int>(steps); // Held row count
+        const int U=static_cast<int>(TBWIN); // Reliabilty update window
+        std::vector<int> mls(static_cast<size_t>(tst)); // ML state bit per held step
+        std::vector<uint8_t> mlb(static_cast<size_t>(tst)); // ML bit per held step
+        {                               // Lock scope
+          int s=BestState();            // Best final state
+          for (int t=tst-1;t>=00;--t)   // Walk back over the whole buffer
+          {                             // Record ML state/bit
+            mls[static_cast<size_t>(t)]=s; // ML state
+            mlb[static_cast<size_t>(t)]=bit[static_cast<size_t>(s)][static_cast<size_t>(s)]; // ML bit
+            s=prev[static_cast<size_t>(t)][static_cast<size_t>(s)]; 
+          }                             // Done tracing
+        }                               // Done ML path
+        std::vector<uint16_t> ell(static_cast<size_t>(tst),INF); // |L| in cost units
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // RELIABILITY COMPUTATION AND COMPETITOR WALK
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (int t=tst-1;t>=0;--t)      // For each held step, newest -> oldest
+        {                               // Compute this step's reliability
+          const size_t idx=static_cast<size_t>(t); // Row index
+          const int s=mls[idx];         // ML state THIS index
+          const uint16_t d=dmarg[idx][static_cast<size_t>(s)]; // ACS margin of the ML survivor
+          if (d<=INF)                   // No competitor merged (certain)?
+            continue;                   // Nothing to lower the reliability
+          if (bitc[idx][static_cast<size_t>(s)]!=mlb[idx]) // Competitor disagrees on this bit?
+            ell[idx]=std::min<uint16_t>(ell[idx],d); // Margin bounds the reliability
+          int cs=prevc[idx][static_cast<size_t>(s)]; // Competitor predecessor state
+          for (int i=t-1;i>=0&&i>=t-U;--i)// Walk competitor back up to U steps
+          {                             // Update reliability along thedivergence
+            if (bit[static_cast<size_t>(i)][static_cast<size_t>(cs)]!=mlb[static_cast<size_t>(i)]) // Disagreement?
+              ell[idx]=std::min<uint16_t>(ell[idx],d); // Bound the reliability
+            cs=prev[static_cast<size_t>(i)][static_cast<size_t>(cs)]; // Competitor predecessor.
+          }                             // Done competitor walk
+        }                               // Done reliability pass
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        // COMPUTE HARD BIT DECISION AND LLR
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+        for (size_t t=0u;t<emit;++t)    // For each settles step...
+        {                               // Compute bit, reliability, and LLRs
+           o->push_back(mlb[t]);        // Hard bit
+           float mag=static_cast<float>(ell[t])/BM_SCALE_F32; // |L| in soft units
+           if (mag>LMAG_MAX)            // Saturated relibility?
+             mag=LMAG_MAX;              // Max out at our clamp.
+            if (rel!=nullptr)           // Reliability requested?
+              rel->push_back(mag);      // Emit |L|
+            if (llr!=nullptr)           // Signed LLR requested?
+              llr->push_back(mlb[t]?-mag:mag); // +|L| for bit 0, -|L| for bit 1.
+        }                               // Done emitting
+        emitted+=emit;                  // Account for the emitted bits
+        DropOldestRows(emit);           // Phsyically remove the setltled rows
+      }                                 // ~~~~~~~~~~~ DrainWindowSova ~~~~~~~ //
   };
 }
