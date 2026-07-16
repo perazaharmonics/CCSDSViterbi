@@ -828,10 +828,15 @@ namespace sdr::mdm
       }                                 // ~~~~~~~~~~ Traceback ~~~~~~~~~~~~ //
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
       // SOVA reliability update pass: after traceback, we have the survivor path and its decisions
-      // for all steps. For each step, we can look at the competitor path that lost at that step and see if it disagreed with the survivor on the decoded bit. If so,
-      // we can compute the metric difference Delta between the survivor and competitor at that step and use it to update the reliability of the decoded bit. The larger the Delta, the more reliable the decoded bit is (the more the survivor won by).
-      // U controls how many steps to look back for reliability updates: U=0 means only the last bit, U=1 means the last two bits, and so on, up to U
-      // =steps means all bits. In practice, a small U (e.g. 5-10) may be sufficient to capture most of the reliability information while keeping complexity manageable.
+      // for all steps. For each step, we can look at the competitor path that lost at that step 
+      // and see if it disagreed with the survivor on the decoded bit. If so,
+      // we can compute the metric difference Delta between the survivor and competitor at that step 
+      // and use it to update the reliability of the decoded bit. 
+      // The larger the Delta, the more reliable the decoded bit is (the more the survivor won by).
+      // U controls how many steps to look back for reliability updates: U=0 means only the last bit, 
+      // U=1 means the last two bits, and so on, up to U
+      // =steps means all bits. In practice, a small U (e.g. 5-10) may be sufficient to capture most of the 
+      // reliability information while keeping complexity manageable.
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
       inline void TracebackSova (
         std::vector<uint8_t>* out,      // Output decoded bits (0/1)
